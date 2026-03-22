@@ -5,8 +5,10 @@ local RunService = game:GetService("RunService")
 local localPlayer = Players.LocalPlayer
 
 local AUTO_RUN_SPEED = 26
+local AUTO_RUN_MAX_SPEED = 52
+local AUTO_RUN_ACCEL_PER_SEC = 0.55
+local AUTO_RUN_ACCEL_PER_100_SCORE = 0.8
 local SIDE_MOVE_SPEED = 16
-local SIDE_INPUT_SCALE = SIDE_MOVE_SPEED / AUTO_RUN_SPEED
 local JUMP_POWER = 60
 local CAMERA_DISTANCE = 14
 local CAMERA_HEIGHT = 6
@@ -17,6 +19,12 @@ local CAMERA_SHAKE_MAGNITUDE = 0.42
 local GAME_OVER_DELAY = 1.0
 local CRASH_COOLDOWN = 1.2
 local OBSTACLE_NAME = "Obstacle"
+local BOUNCE_UPWARD_SPEED = 42
+local BOUNCE_COOLDOWN = 0.16
+local RUNNER_SPAWN_NAME = "SpawnLocation"
+local EXPLORE_SPAWN_NAME = "ExploreSpawn"
+local MODE_RUNNER = "Runner"
+local MODE_EXPLORE = "Explore"
 
 local player = localPlayer
 local character = player.Character or player.CharacterAdded:Wait()
@@ -34,6 +42,12 @@ local isGameOver = false
 local shakeTimeLeft = 0
 local hitLockUntil = 0
 local bodyConnections = {}
+local runElapsedTime = 0
+local currentRunSpeed = AUTO_RUN_SPEED
+local currentMode: string? = nil
+local clearBodyConnections: () -> ()
+local wireBodyTouchEvents: (Model) -> ()
+local lastBounceAt = 0
 
 local playerGui = player:WaitForChild("PlayerGui")
 local gameGui = Instance.new("ScreenGui")
@@ -111,6 +125,74 @@ buttonRetry.TextColor3 = Color3.fromRGB(255, 255, 255)
 buttonRetry.Text = "Retry"
 buttonRetry.Parent = gameOverFrame
 
+local modeSelectFrame = Instance.new("Frame")
+modeSelectFrame.Name = "ModeSelect"
+modeSelectFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+modeSelectFrame.Position = UDim2.fromScale(0.5, 0.5)
+modeSelectFrame.Size = UDim2.fromOffset(420, 260)
+modeSelectFrame.BackgroundColor3 = Color3.fromRGB(14, 14, 20)
+modeSelectFrame.BackgroundTransparency = 0.08
+modeSelectFrame.Visible = true
+modeSelectFrame.Parent = gameGui
+
+local modeTitle = Instance.new("TextLabel")
+modeTitle.Name = "Title"
+modeTitle.BackgroundTransparency = 1
+modeTitle.Position = UDim2.fromOffset(24, 18)
+modeTitle.Size = UDim2.fromOffset(372, 48)
+modeTitle.Font = Enum.Font.GothamBlack
+modeTitle.TextSize = 46
+modeTitle.TextColor3 = Color3.fromRGB(248, 248, 248)
+modeTitle.Text = "Temple Run"
+modeTitle.Parent = modeSelectFrame
+
+local buttonRunner = Instance.new("TextButton")
+buttonRunner.Name = "Runner"
+buttonRunner.Position = UDim2.fromOffset(24, 106)
+buttonRunner.Size = UDim2.fromOffset(178, 110)
+buttonRunner.BackgroundColor3 = Color3.fromRGB(52, 117, 214)
+buttonRunner.Font = Enum.Font.GothamBold
+buttonRunner.TextSize = 32
+buttonRunner.TextColor3 = Color3.fromRGB(255, 255, 255)
+buttonRunner.Text = "Runner"
+buttonRunner.Parent = modeSelectFrame
+
+local buttonExplore = Instance.new("TextButton")
+buttonExplore.Name = "Explore"
+buttonExplore.Position = UDim2.fromOffset(218, 106)
+buttonExplore.Size = UDim2.fromOffset(178, 110)
+buttonExplore.BackgroundColor3 = Color3.fromRGB(45, 156, 102)
+buttonExplore.Font = Enum.Font.GothamBold
+buttonExplore.TextSize = 32
+buttonExplore.TextColor3 = Color3.fromRGB(255, 255, 255)
+buttonExplore.Text = "Explore"
+buttonExplore.Parent = modeSelectFrame
+
+local function getSpawnByName(name: string): SpawnLocation?
+	local candidate = workspace:FindFirstChild(name)
+	if candidate and candidate:IsA("SpawnLocation") then
+		return candidate
+	end
+
+	return nil
+end
+
+local function teleportToSpawn(spawnName: string)
+	if not rootPart then
+		return
+	end
+
+	local spawn = getSpawnByName(spawnName)
+	if not spawn then
+		return
+	end
+
+	local targetPosition = spawn.Position + Vector3.new(0, 3.5, 0)
+	rootPart.CFrame = CFrame.new(targetPosition)
+	rootPart.AssemblyLinearVelocity = Vector3.zero
+	rootPart.AssemblyAngularVelocity = Vector3.zero
+end
+
 local function updateScoreLabel()
 	scoreLabel.Text = string.format("Score: %d", currentScore)
 end
@@ -121,28 +203,77 @@ local function syncScoreFromDistance()
 	updateScoreLabel()
 end
 
+local function updateRunSpeed(deltaTime: number)
+	runElapsedTime += deltaTime
+
+	local scorePressure = (currentScore / 100) * AUTO_RUN_ACCEL_PER_100_SCORE
+	local timePressure = runElapsedTime * AUTO_RUN_ACCEL_PER_SEC
+	local targetSpeed = AUTO_RUN_SPEED + timePressure + scorePressure
+	currentRunSpeed = math.min(AUTO_RUN_MAX_SPEED, targetSpeed)
+	humanoid.WalkSpeed = currentRunSpeed
+end
+
 local function resetRunState(resetScore: boolean)
 	isCrashed = false
 	isGameOver = false
 	shakeTimeLeft = 0
 	hitLockUntil = time() + CRASH_COOLDOWN
+	lastBounceAt = 0
 	humanoid.PlatformStand = false
 	humanoid.AutoRotate = false
-	humanoid.WalkSpeed = AUTO_RUN_SPEED
 	humanoid.UseJumpPower = true
 	humanoid.JumpPower = JUMP_POWER
 	rootPart.AssemblyLinearVelocity = Vector3.zero
 	rootPart.AssemblyAngularVelocity = Vector3.zero
 
 	if resetScore then
+		runElapsedTime = 0
+		currentRunSpeed = AUTO_RUN_SPEED
 		scoreStartDistance = rootPart.Position:Dot(forwardDir)
 		currentScore = 0
 		updateScoreLabel()
 	else
 		scoreStartDistance = rootPart.Position:Dot(forwardDir) - currentScore
+		runElapsedTime = (currentRunSpeed - AUTO_RUN_SPEED) / AUTO_RUN_ACCEL_PER_SEC
 	end
 
+	humanoid.WalkSpeed = currentRunSpeed
+
 	gameOverFrame.Visible = false
+	scoreLabel.Visible = true
+end
+
+local function activateExploreMode()
+	currentMode = MODE_EXPLORE
+	modeSelectFrame.Visible = false
+	gameOverFrame.Visible = false
+	scoreLabel.Visible = true
+	leftHeld = false
+	rightHeld = false
+	clearBodyConnections()
+
+	humanoid.PlatformStand = false
+	humanoid.AutoRotate = true
+	humanoid.WalkSpeed = 16
+	humanoid.UseJumpPower = true
+	humanoid.JumpPower = 50
+
+	local camera = workspace.CurrentCamera
+	if camera then
+		camera.CameraType = Enum.CameraType.Custom
+		camera.CameraSubject = humanoid
+	end
+
+	teleportToSpawn(EXPLORE_SPAWN_NAME)
+end
+
+local function activateRunnerMode(resetScore: boolean)
+	currentMode = MODE_RUNNER
+	modeSelectFrame.Visible = false
+	teleportToSpawn(RUNNER_SPAWN_NAME)
+	updateTrackDirections()
+	resetRunState(resetScore)
+	wireBodyTouchEvents(character)
 end
 
 local function showGameOver()
@@ -177,22 +308,60 @@ local function triggerCrash()
 	task.delay(GAME_OVER_DELAY, showGameOver)
 end
 
+local function isObstacleContact(hit: BasePart): boolean
+	local node: Instance? = hit
+
+	for _ = 1, 8 do
+		if not node then
+			break
+		end
+
+		if node.Name == OBSTACLE_NAME or node:GetAttribute("IsObstacle") == true then
+			return true
+		end
+
+		node = node.Parent
+	end
+
+	return false
+end
+
 local function onBodyTouched(hit: BasePart)
-	if not hit or hit.Name ~= OBSTACLE_NAME then
+	if not hit then
+		return
+	end
+
+	if not isObstacleContact(hit) then
 		return
 	end
 
 	triggerCrash()
 end
 
-local function clearBodyConnections()
+local function pollObstacleCollision()
+	if isCrashed or isGameOver then
+		return
+	end
+
+	local checkSize = Vector3.new(rootPart.Size.X * 1.45, rootPart.Size.Y * 1.25, rootPart.Size.Z * 1.45)
+	local touchingParts = workspace:GetPartBoundsInBox(rootPart.CFrame, checkSize)
+
+	for _, part in ipairs(touchingParts) do
+		if part:IsA("BasePart") and not part:IsDescendantOf(character) and isObstacleContact(part) then
+			triggerCrash()
+			return
+		end
+	end
+end
+
+clearBodyConnections = function()
 	for _, connection in ipairs(bodyConnections) do
 		connection:Disconnect()
 	end
 	table.clear(bodyConnections)
 end
 
-local function wireBodyTouchEvents(targetCharacter: Model)
+wireBodyTouchEvents = function(targetCharacter: Model)
 	clearBodyConnections()
 
 	local function hookPart(part: Instance)
@@ -237,25 +406,44 @@ local function onCharacterAdded(newCharacter: Model)
 	character = newCharacter
 	humanoid = character:WaitForChild("Humanoid")
 	rootPart = character:WaitForChild("HumanoidRootPart")
-	humanoid.AutoRotate = false
-	humanoid.WalkSpeed = AUTO_RUN_SPEED
-	humanoid.UseJumpPower = true
-	humanoid.JumpPower = JUMP_POWER
-	updateTrackDirections()
-	resetRunState(true)
-	wireBodyTouchEvents(character)
+
+	if currentMode == MODE_EXPLORE then
+		activateExploreMode()
+	elseif currentMode == MODE_RUNNER then
+		activateRunnerMode(true)
+	else
+		modeSelectFrame.Visible = true
+		scoreLabel.Visible = true
+		gameOverFrame.Visible = false
+		humanoid.AutoRotate = true
+		humanoid.WalkSpeed = 0
+		humanoid.JumpPower = 0
+		clearBodyConnections()
+	end
 end
 
 player.CharacterAdded:Connect(onCharacterAdded)
-humanoid.AutoRotate = false
-humanoid.WalkSpeed = AUTO_RUN_SPEED
-humanoid.UseJumpPower = true
-humanoid.JumpPower = JUMP_POWER
-updateTrackDirections()
-resetRunState(true)
-wireBodyTouchEvents(character)
+modeSelectFrame.Visible = true
+scoreLabel.Visible = true
+gameOverFrame.Visible = false
+humanoid.AutoRotate = true
+humanoid.WalkSpeed = 0
+humanoid.JumpPower = 0
+clearBodyConnections()
+
+buttonRunner.MouseButton1Click:Connect(function()
+	activateRunnerMode(true)
+end)
+
+buttonExplore.MouseButton1Click:Connect(function()
+	activateExploreMode()
+end)
 
 buttonRetry.MouseButton1Click:Connect(function()
+	if currentMode ~= MODE_RUNNER then
+		return
+	end
+
 	gameOverFrame.Visible = false
 	leftHeld = false
 	rightHeld = false
@@ -263,7 +451,7 @@ buttonRetry.MouseButton1Click:Connect(function()
 end)
 
 buttonContinue.MouseButton1Click:Connect(function()
-	if not isGameOver then
+	if currentMode ~= MODE_RUNNER or not isGameOver then
 		return
 	end
 
@@ -274,6 +462,10 @@ buttonContinue.MouseButton1Click:Connect(function()
 end)
 
 UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessed: boolean)
+	if currentMode ~= MODE_RUNNER then
+		return
+	end
+
 	if gameProcessed then
 		return
 	end
@@ -288,6 +480,10 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessed: 
 end)
 
 UserInputService.InputEnded:Connect(function(input: InputObject)
+	if currentMode ~= MODE_RUNNER then
+		return
+	end
+
 	if input.KeyCode == Enum.KeyCode.A or input.KeyCode == Enum.KeyCode.Left then
 		leftHeld = false
 	elseif input.KeyCode == Enum.KeyCode.D or input.KeyCode == Enum.KeyCode.Right then
@@ -300,11 +496,28 @@ RunService.RenderStepped:Connect(function(deltaTime)
 		return
 	end
 
+	pollObstacleCollision()
+
+	if currentMode ~= MODE_RUNNER then
+		local camera = workspace.CurrentCamera
+		if camera then
+			camera.CameraType = Enum.CameraType.Custom
+			camera.CameraSubject = humanoid
+		end
+		return
+	end
+
+	if not scoreLabel.Visible then
+		scoreLabel.Visible = true
+	end
+
 	syncScoreFromDistance()
 
 	if not isCrashed and not isGameOver then
+		updateRunSpeed(deltaTime)
 		local sideInput = currentSideInput()
-		local desiredDirection = (forwardDir + (rightDir * sideInput * SIDE_INPUT_SCALE)).Unit
+		local sideInputScale = SIDE_MOVE_SPEED / math.max(1, currentRunSpeed)
+		local desiredDirection = (forwardDir + (rightDir * sideInput * sideInputScale)).Unit
 		humanoid:Move(desiredDirection, false)
 	else
 		humanoid:Move(Vector3.zero, false)
