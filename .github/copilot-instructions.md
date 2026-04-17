@@ -1,3 +1,3 @@
 Rules:
 1. Ensure that before implementation, stop the game from play mode. And only then shall implementation happens
-2. Important scripts (such as mechanics, and special features) should be put on ServerScriptStorage.
+2. If what was tasked to be edited will run over an existing script (through editing and stuff). Backup that script first and add a comment inside it indicating the date of backup. Then create a copy of the "to be" edited script and edit. Lastly disable the script backup so it wouldn't be use in game.
